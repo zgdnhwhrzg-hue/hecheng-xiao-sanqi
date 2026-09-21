@@ -286,39 +286,70 @@ const sfx = (() => {
   let ac = null, muted = false;
   try { muted = localStorage.getItem('hcdz-muted') === '1'; } catch(e) {}
   function ctx(){
-    if (!ac) { try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch(e) {} }
-    if (ac && ac.state === 'suspended') ac.resume();
+    if (!ac) {
+      try {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        ac = new AudioCtx({ latencyHint:'interactive' });
+      } catch(e) {}
+    }
     return ac;
+  }
+  function unlock(){
+    const c = ctx();
+    if (!c) return Promise.resolve(null);
+    const resume = c.state === 'suspended' ? c.resume() : Promise.resolve();
+    return resume.then(() => {
+      // iOS Safari 需要在用户触摸事件内播放一个极短的静音缓冲来解锁音频。
+      try {
+        const src = c.createBufferSource();
+        src.buffer = c.createBuffer(1, 1, c.sampleRate);
+        src.connect(c.destination);
+        src.start(0);
+      } catch(e) {}
+      return c;
+    }).catch(() => null);
+  }
+  function ready(play){
+    if (muted) return;
+    unlock().then(c => { if (c) play(c); });
   }
   function tone(f0, f1, dur, type, vol){
     if (muted) return;
-    const c = ctx(); if (!c) return;
-    const o = c.createOscillator(), g = c.createGain();
-    o.type = type || 'sine';
-    o.frequency.setValueAtTime(f0, c.currentTime);
-    if (f1) o.frequency.exponentialRampToValueAtTime(Math.max(30, f1), c.currentTime + dur);
-    g.gain.setValueAtTime(vol, c.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + dur);
-    o.connect(g); g.connect(c.destination);
-    o.start(); o.stop(c.currentTime + dur + 0.03);
+    ready(c => {
+      const o = c.createOscillator(), g = c.createGain();
+      o.type = type || 'sine';
+      o.frequency.setValueAtTime(f0, c.currentTime);
+      if (f1) o.frequency.exponentialRampToValueAtTime(Math.max(30, f1), c.currentTime + dur);
+      g.gain.setValueAtTime(vol, c.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + dur);
+      o.connect(g); g.connect(c.destination);
+      o.start(); o.stop(c.currentTime + dur + 0.03);
+    });
   }
   function noise(dur, vol){
     if (muted) return;
-    const c = ctx(); if (!c) return;
-    const n = c.createBufferSource();
-    const buf = c.createBuffer(1, c.sampleRate * dur, c.sampleRate);
-    const d = buf.getChannelData(0);
-    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * vol * (1 - i / d.length);
-    n.buffer = buf;
-    const f = c.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 420;
-    const g = c.createGain(); g.gain.setValueAtTime(vol, c.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + dur);
-    n.connect(f); f.connect(g); g.connect(c.destination);
-    n.start();
+    ready(c => {
+      const n = c.createBufferSource();
+      const buf = c.createBuffer(1, c.sampleRate * dur, c.sampleRate);
+      const d = buf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * vol * (1 - i / d.length);
+      n.buffer = buf;
+      const f = c.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 420;
+      const g = c.createGain(); g.gain.setValueAtTime(vol, c.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + dur);
+      n.connect(f); f.connect(g); g.connect(c.destination);
+      n.start();
+    });
   }
   return {
     get muted(){ return muted; },
-    toggle(){ muted = !muted; try { localStorage.setItem('hcdz-muted', muted ? '1' : '0'); } catch(e) {} document.getElementById('muteBtn').classList.toggle('off', muted); },
+    unlock,
+    toggle(){
+      muted = !muted;
+      try { localStorage.setItem('hcdz-muted', muted ? '1' : '0'); } catch(e) {}
+      document.getElementById('muteBtn').classList.toggle('off', muted);
+      if (!muted) { unlock(); tone(440, 660, 0.1, 'sine', 0.12); }
+    },
     drop(){ noise(0.09, 0.5); },
     merge(lv){ tone(280 + lv * 90, 560 + lv * 150, 0.14, 'triangle', 0.3); tone(560 + lv * 150, 900 + lv * 200, 0.12, 'sine', 0.12); },
     win(){ [523, 659, 784, 1046, 1318].forEach((f, i) => setTimeout(() => tone(f, f, 0.2, 'triangle', 0.22), i * 110)); },
@@ -428,6 +459,7 @@ function evtX(e){
 function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
 
 canvas.addEventListener('pointerdown', e => {
+  sfx.unlock();
   if (state === 'won' || state === 'over') return;
   e.preventDefault();
   state = 'aiming';
@@ -462,7 +494,7 @@ function pickLevel(){
 }
 
 /* ============ 胜负判定 ============ */
-function checkDanger(){
+function checkDanger(dt){
   if (state === 'won' || state === 'over') return;
   let anyDanger = false;
   for (const b of Composite.allBodies(world)) {
@@ -471,7 +503,7 @@ function checkDanger(){
     if (b.position.y < -12 && b.speed < 1.6) { gameOver(); return; }
   }
   if (anyDanger) {
-    dangerAcc += 16.6;
+    dangerAcc += dt;
     if (dangerAcc > 950) gameOver();
   } else dangerAcc = 0;
 }
@@ -624,19 +656,35 @@ function download(url){
 }
 
 /* ============ 主循环 ============ */
+const PHYSICS_STEP = 1000 / 60;
+let lastFrameTime = 0;
+let physicsAccumulator = 0;
 function loop(t){
   requestAnimationFrame(loop);
-  Engine.update(engine, 16.666);
+  if (!lastFrameTime) lastFrameTime = t;
+  const frameDt = Math.min(50, Math.max(0, t - lastFrameTime));
+  lastFrameTime = t;
+  physicsAccumulator += frameDt;
+  let physicsSteps = 0;
+  while (physicsAccumulator >= PHYSICS_STEP && physicsSteps < 3) {
+    Engine.update(engine, PHYSICS_STEP);
+    physicsAccumulator -= PHYSICS_STEP;
+    physicsSteps++;
+  }
+  const frameScale = frameDt / PHYSICS_STEP;
   for (const b of Composite.allBodies(world)) {
     if (b.label !== 'ball') continue;
-    b.plugin.squash *= 0.86;
-    if (b.plugin.spawnScale < 1) b.plugin.spawnScale = Math.min(1, b.plugin.spawnScale + 0.05);
+    b.plugin.squash *= Math.pow(0.86, frameScale);
+    if (b.plugin.spawnScale < 1) b.plugin.spawnScale = Math.min(1, b.plugin.spawnScale + 0.05 * frameScale);
   }
-  tickFx(16.6);
+  tickFx(frameDt);
   draw();
-  checkDanger();
+  checkDanger(frameDt);
 }
 requestAnimationFrame(loop);
+
+// iPhone/iPad 会阻止未经过用户操作启动的 WebAudio；首次触摸时主动解锁。
+document.addEventListener('touchstart', () => sfx.unlock(), { passive:true });
 
 /* ============ 按钮绑定 ============ */
 document.getElementById('muteBtn').addEventListener('click', () => sfx.toggle());
